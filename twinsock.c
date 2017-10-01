@@ -4,28 +4,25 @@
  *  Copyright (C) 1994  Troy Rollo <troy@cbme.unsw.EDU.AU>
  *
  *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
+ *  it under the terms of the license in the file LICENSE.TXT included
+ *  with the TwinSock distribution.
  *
  *  This program is distributed in the hope that it will be useful,
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
  */
 
 #include <winsock.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include "twinsock.h"
 #include "tx.h"
 
 HINSTANCE	hinst;
 
-extern	RegisterManager(HWND hwnd);
+extern	far pascal RegisterManager(HWND hwnd);
+extern	far pascal ResponseReceived(struct tx_request *ptxr);
+extern far pascal SetInitialised(void);
 static void SendInitRequest(void);
 void	Shutdown(void);
 void	OpenPort(void);
@@ -36,6 +33,7 @@ extern	int	iPortChanged;
 #define	TIMER_ID_RECEIVE	2
 #define	TIMER_ID_FLUSH		3
 #define	TIMER_ID_BREAK		4
+#define TIMER_ID_COMMCHECK	5
 
 static	int	idComm;
 static	HWND	hwnd;
@@ -51,7 +49,11 @@ static	int	cyRow, cxColumn;
 #define	ROW_INDEX(x)	((x + iScrollRow) % SCREEN_ROWS)
 
 static	char	const	achProtoInit[] = "@$TSStart$@";
+
+extern	enum Encoding eLine;
 static	int	iInitChar = 0;
+long	nDiscarded = 0;
+long	nBytesRecvd = 0;
 
 extern	void PacketReceiveData(void *pvData, int iLen);
 
@@ -85,8 +87,9 @@ void	FlushInput(void)
 }
 
 static	void
-AddChar(char c)
+SendToScreen(char c)
 {
+
 	RECT	rcClient;
 	RECT	rcRedraw;
 
@@ -127,6 +130,12 @@ AddChar(char c)
 		if (iColumn < SCREEN_COLUMNS - 1)
 			iColumn++;
 	}
+}
+
+static	void
+AddChar(char c)
+{
+	SendToScreen(c);
 	if (c == achProtoInit[iInitChar])
 	{
 		iInitChar++;
@@ -135,22 +144,32 @@ AddChar(char c)
 			iInitChar = 0;
 			bTerminal = 0;
 			RegisterManager(hwnd);
+			InitProtocol();
 			SendInitRequest();
 		}
 	}
-	else
+	else if (iInitChar == 9 && isdigit(c))
+	{
+		eLine = (enum Encoding) (c - '0');
+	}
+	else if (iInitChar)
 	{
 		iInitChar = 0;
+		eLine = E_6Bit;
 	}
 }
 
 static	void	DoReading(void)
 {
 	static	char	achBuffer[READ_MAX];
+	static	BOOL	bAlreadyHere = FALSE;
 	int	nRead;
 	COMSTAT	cs;
 	int	i;
 
+	if (bAlreadyHere)
+		return;
+	bAlreadyHere = TRUE;
 	do
 	{
 		nRead = ReadComm(idComm, achBuffer, READ_MAX);
@@ -171,14 +190,17 @@ static	void	DoReading(void)
 			}
 			else if (bFlushing)
 			{
+				nDiscarded += nRead;
 				FlushInput();
 			}
 			else
 			{
+				nBytesRecvd += nRead;
 				PacketReceiveData(achBuffer, nRead);
 			}
 		}
-	} while (nRead);
+	} while (nRead || cs.cbInQue);
+	bAlreadyHere = FALSE;
 }
 
 int	SendData(void *pvData, int iDataLen)
@@ -292,6 +314,11 @@ WindowProc(	HWND	hWnd,
 				DialNumber(hWnd);
 			break;
 
+		case 106:
+			if (!bTerminal)
+				ShowProtoInfo(hWnd);
+			break;
+
 		case 201:
 			About(hWnd);
 			break;
@@ -319,7 +346,7 @@ WindowProc(	HWND	hWnd,
 		switch(wParam)
 		{
 		case TIMER_ID_SEND:
-			TimeoutReceived(TIMER_ID_SEND);
+			TimeoutReceived();
 			break;
 
 		case TIMER_ID_RECEIVE:
@@ -336,6 +363,10 @@ WindowProc(	HWND	hWnd,
 			ClearCommBreak(idComm);
 			KillTimer(hWnd, TIMER_ID_BREAK);
 			break;
+
+ 		case TIMER_ID_COMMCHECK:
+ 			DoReading();
+ 			break;
 		}
 		break;
 
@@ -375,6 +406,7 @@ DataReceived(void *pvData, int iLen)
 	short	nPktLen;
 	enum Functions ft;
 	int	nCopy;
+	int	i;
 
 	while (iLen)
 	{
@@ -418,6 +450,13 @@ DataReceived(void *pvData, int iLen)
 						CloseWindow(hwnd);
 						SetInitialised();
 					}
+				}
+				else if (ft == FN_Message)
+				{
+					SendToScreen('\r');
+					SendToScreen('\n');
+					for (i = 0; i < nPktLen - 10; i++)
+						SendToScreen(ptxr->pchData[i]);
 				}
 				else
 				{
@@ -520,6 +559,7 @@ OpenPort(void)
 
 	InitComm(idComm);
 	EnableCommNotification(idComm, hwnd, 1, 0);
+ 	SetTimer(hwnd, TIMER_ID_COMMCHECK, 1000, 0);
 }
 
 #pragma argsused

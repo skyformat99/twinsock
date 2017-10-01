@@ -1,32 +1,28 @@
 /*
  *  TwinSock - "Troy's Windows Sockets"
  *
- *  Copyright (C) 1994  Troy Rollo <troy@cbme.unsw.EDU.AU>
+ *  Copyright (C) 1994-1995  Troy Rollo <troy@cbme.unsw.EDU.AU>
  *
  *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
+ *  it under the terms of the license in the file LICENSE.TXT included
+ *  with the TwinSock distribution.
  *
  *  This program is distributed in the hope that it will be useful,
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
  */
 
 #include <stdio.h>
 #ifdef __MSDOS__
 #include <winsock.h>
 #include <stdlib.h>
+#include <string.h>
 #else
 #include <sys/types.h>
 #include <netinet/in.h>
 #endif
 #include "packet.h"
+#include "twinsock.h"
 
 #define	MAX_STREAMS	256
 #define	WINDOW_SIZE	4
@@ -34,7 +30,22 @@
 short	nInSeq = 0;
 short	nOutSeq = 0;
 
+long	nCRCErrors = 0;
+long	nRetransmits = 0;
+long	nTimeouts = 0;
+long	nInsane = 0;
+long	nIncomplete = 0;
+
+enum Encoding eLine = E_6Bit;
+
 extern	int	SendData(void	*pvData, int nBytes);
+
+static	char	achEscaped[256];
+static	int	nEscaped = 0;
+static	char	achIgnored[256];
+static	int	nIgnored = 0;
+static	char	achBuffer[1024];
+static	int	nOffset = 0;
 
 static unsigned long crc_32_tab[] = { /* CRC polynomial 0xedb88320 */
 0x00000000l, 0x77073096l, 0xee0e612cl, 0x990951bal, 0x076dc419l, 0x706af48fl, 0xe963a535l, 0x9e6495a3l,
@@ -85,7 +96,7 @@ int size;
 		crc = UPDC32(*data++, crc);
 	}
 	crc = ~crc;
-	return (crc & 0xffff);
+	return ((short)crc & 0xffff);
 }
 
 struct	packet_queue
@@ -145,50 +156,159 @@ int	TransmitData(void *pvData, int iDataLen)
 	char	*pchDataIn;
 	char	*pchDataOut;
 	char	c;
-	int	iIn, iOut;
+	int	iIn, iOut, iCheck;
 	int	nBits;
 	int	nBitsLeft;
 	int	nBitsNow;
 	int	nDataOut;
 	char	cNow, cTmp;
+	int	nBitsCode;
 
-	nDataOut = iDataLen * 4 / 3 + 1;
-	if (iDataLen % 6)
-		nDataOut++;
 	pchDataIn = (char *) pvData;
-	pchDataOut = (char *) malloc(nDataOut);
+	pchDataOut = (char *) malloc(iDataLen * 2 + 1); /* Worst case */
 	nBits = nBitsLeft = 0;
 	cNow = 0;
-	pchDataOut[0] = '@';	/* Signals the receiving end to realign to bit 0 */
-	for (iIn = 0, iOut = 1; iOut < nDataOut;)
+	switch(eLine)
 	{
-		if (nBitsLeft)
+	case E_8NoHiCtrl:
+	case E_6Bit:
+		if (eLine == E_6Bit)
 		{
-			cTmp = c & ((1 << nBitsLeft) - 1);
-			nBitsNow = 6 - nBits;
-			if (nBitsLeft < nBitsNow)
-				nBitsNow = nBitsLeft;
-			cNow <<= nBitsNow;
-			cTmp >>= nBitsLeft - nBitsNow;
-			cTmp &= ((1 << nBitsNow) - 1);
-			cNow |= cTmp;
-			nBits += nBitsNow;
-			nBitsLeft -= nBitsNow;
-			if (nBits == 6)
-			{
-				pchDataOut[iOut++] = ach6bit[cNow];
-				cNow = 0;
-				nBits = 0;
-			}
+			nBitsCode = 6;
+			nDataOut = iDataLen * 4 / 3 + 1;
 		}
 		else
 		{
-			if (iIn < iDataLen)
-				c = pchDataIn[iIn++];
-			else
-				c = 0;
-			nBitsLeft = 8;
+			nBitsCode = 7;
+			nDataOut = (int) ((long) iDataLen * 8 / 7 + 1);
 		}
+		if (iDataLen % nBitsCode)
+			nDataOut++;
+		pchDataOut[0] = '@';	/* Signals the receiving end to realign to bit 0 */
+		for (iIn = 0, iOut = 1; iOut < nDataOut;)
+		{
+			if (nBitsLeft)
+			{
+				cTmp = c & ((1 << nBitsLeft) - 1);
+				nBitsNow = nBitsCode - nBits;
+				if (nBitsLeft < nBitsNow)
+					nBitsNow = nBitsLeft;
+				cNow <<= nBitsNow;
+				cTmp >>= nBitsLeft - nBitsNow;
+				cTmp &= ((1 << nBitsNow) - 1);
+				cNow |= cTmp;
+				nBits += nBitsNow;
+				nBitsLeft -= nBitsNow;
+				if (nBits == nBitsCode)
+				{
+					if (cNow >= 64)
+					{
+						pchDataOut[iOut] = ach6bit[cNow - 64];
+						pchDataOut[iOut++] |= 0x80;
+					}
+					else
+					{
+						pchDataOut[iOut++] = ach6bit[cNow];
+					}
+					cNow = 0;
+					nBits = 0;
+				}
+			}
+			else
+			{
+				if (iIn < iDataLen)
+					c = pchDataIn[iIn++];
+				else
+					c = 0;
+				nBitsLeft = 8;
+			}
+		}
+		break;
+
+	case E_Explicit:
+		for (iIn = iOut = 0; iIn < iDataLen; iIn++)
+		{
+			c = pchDataIn[iIn];
+			if (c == '@')
+			{
+				strcpy(pchDataOut + iOut, "@ ");
+				iOut += 2;
+			}
+			else if (c == '\030')
+			{
+				pchDataOut[iOut++] = '@';
+				pchDataOut[iOut++] = c + nOffset;
+			}
+			else
+			{
+				for (iCheck = 0; iCheck < nEscaped; iCheck++)
+				{
+					if (achEscaped[iCheck] == c)
+					{
+						pchDataOut[iOut++] = '@';
+						pchDataOut[iOut++] = c + nOffset;
+						break;
+					}
+				}
+				if (iCheck == nEscaped)
+				{
+					pchDataOut[iOut++] = c;
+				}
+			}
+		}
+		nDataOut = iOut;
+		break;
+
+	case E_8Bit:
+	case E_8NoX:
+	case E_8NoCtrl:
+	case E_8NoHiX:
+		for (iIn = 0, iOut = 0; iIn < iDataLen; iIn++)
+		{
+			c = pchDataIn[iIn];
+			if (c == '@')
+			{
+				strcpy(pchDataOut + iOut, "@ ");
+				iOut += 2;
+			}
+			else if (c == '\030')
+			{
+				strcpy(pchDataOut + iOut, "@X");
+				iOut += 2;
+			}
+			else if (eLine == E_8NoX && c == '\023')
+			{
+				strcpy(pchDataOut + iOut, "@S");
+				iOut += 2;
+			}
+			else if (eLine == E_8NoX && c == '\021')
+			{
+				strcpy(pchDataOut + iOut, "@Q");
+				iOut += 2;
+			}
+			else if (eLine == E_8NoHiX && c == '\223')
+			{
+				strcpy(pchDataOut + iOut, "@\323");
+				iOut += 2;
+			}
+			else if (eLine == E_8NoHiX && c == '\221')
+			{
+				strcpy(pchDataOut + iOut, "@\321");
+				iOut += 2;
+			}
+			else if (eLine == E_8NoCtrl &&
+				 c >= 0 && c < '\040')
+			{
+				pchDataOut[iOut++] = '@';
+				pchDataOut[iOut++] = c + '@';
+			}
+			else
+			{
+				pchDataOut[iOut++] = c;
+			}
+		}
+		nDataOut = iOut;
+		break;
 	}
 	nDataOut =  SendData(pchDataOut, nDataOut);
 	free(pchDataOut);
@@ -245,8 +365,12 @@ void	TimeoutReceived(void)
 {
 	struct	packet_queue *ppq;
 
+	nTimeouts++;
 	for (ppq = ppqSent; ppq; ppq = ppq->ppqNext)
+	{
+		nRetransmits++;
 		TransmitPacket(ppq);
+	}
 }
 
 void	InitHead()
@@ -281,20 +405,22 @@ void	TransmitHead(void)
 static	void
 AckReceived(int id)
 {
-	struct packet_queue **pppq, *ppqTemp;
+	struct packet_queue **pppq, *ppq, *ppqTemp;
 
 	for (pppq = &ppqSent;
 	     *pppq && (*pppq)->idPacket != id;
 	     pppq = &(*pppq)->ppqNext);
-	if (*pppq)
+	ppq = *pppq;
+	if (ppq)
 	{
-		while (ppqSent != *pppq)
+		while (ppqSent != ppq)
 		{
 			ppqTemp = ppqSent;
 			ppqSent = ppqTemp->ppqNext;
 			ppqTemp->ppqNext = 0;
 			InsertInQueue(&ppqSent, ppqTemp);
 			TransmitPacket(ppqTemp);
+			nRetransmits++;
 		}
 		ppqTemp = ppqSent;
 		ppqSent = ppqTemp->ppqNext;
@@ -371,11 +497,72 @@ void	PoppedPacket(struct packet_queue *ppqPopped)
 	}
 }
 
+static	int
+CopyCharacters(	char	*c,
+		char	*achDest)
+{
+	char	cCurrent;
+	int	iTotal = 0;
+
+		while (*c)
+	{
+		while (isspace(*c))
+			c++;
+		if (*c == '\\')
+		{
+			cCurrent = 	((int) (c[1] - '0')) * 64 +
+					((int) (c[2] - '0')) * 8 +
+					((int) (c[3] - '0'));
+			c += 4;
+			achDest[iTotal++] = cCurrent;
+		}
+		else if (*c == '^')
+		{
+			cCurrent = c[1] - 64;
+			c += 2;
+			if (*c == '!')
+			{
+				cCurrent |= 0x80;
+				c++;
+			}
+			achDest[iTotal++] = cCurrent;
+		}
+		while (!isspace(*c) && *c)
+			c++;
+	}
+	return iTotal;
+}
+
+void
+InitProtocol(void)
+{
+	if (eLine == E_Explicit)
+	{
+		GetTwinSockSetting(	"Protocol",
+					"Escaped",
+					"",
+					achBuffer,
+					sizeof(achBuffer));
+		nEscaped = CopyCharacters(achBuffer, achEscaped);
+		GetTwinSockSetting(	"Protocol",
+					"Ignored",
+					"",
+					achBuffer,
+					sizeof(achBuffer));
+		nIgnored = CopyCharacters(achBuffer, achIgnored);
+		GetTwinSockSetting(	"Protocol",
+					"Offset",
+					"64",
+					achBuffer,
+					sizeof(achBuffer));
+		nOffset = atoi(achBuffer);
+	}
+}
+
 void	SendPacket(void	*pvData, int iDataLen, int iStream, int iFlags)
 {
 	struct	packet	*pkt;
 	struct	packet_queue *ppq;
-	short	nCRC;
 
 	if (!iInitialised)
 	{
@@ -420,7 +607,6 @@ void	ProcessData(void *pvData, int nDataLen)
 	static	struct	packet	pkt;
 	static	int	nBytes = 0;
 	int		nToCopy;
-	int		nData;
 	enum packet_type pt;
 	short		iLen;
 	short		nCRC;
@@ -429,6 +615,7 @@ void	ProcessData(void *pvData, int nDataLen)
 
 	if (!pvData)	/* Receive timeout */
 	{
+		nIncomplete++;
 		nBytes = 0;
 		return;
 	}
@@ -453,6 +640,7 @@ void	ProcessData(void *pvData, int nDataLen)
 		id = ntohs(pkt.iPacketID);
 		if (iLen > PACKET_MAX || iLen < 0) /* Sanity check */
 		{
+			nInsane++;
 			nBytes = 0;
 			nDataLen = 0;
 			KillReceiveTimeout();
@@ -463,7 +651,7 @@ void	ProcessData(void *pvData, int nDataLen)
 				SetTransmitTimeout();
 			return;
 		}
-		if (nBytes < sizeof(short) * 4 + iLen)
+		if (nBytes < ((int) sizeof(short) * 4 + iLen))
 		{
 			nToCopy = sizeof(short) * 4 + iLen - nBytes;
 			if (nDataLen < nToCopy)
@@ -473,7 +661,7 @@ void	ProcessData(void *pvData, int nDataLen)
 			nDataLen -= nToCopy;
 			nBytes += nToCopy;
 		}
-		if (nBytes == sizeof(short) * 4 + iLen)
+		if (nBytes == ((int) sizeof(short) * 4 + iLen))
 		{
 			nBytes = 0;
 			pkt.nCRC = 0;
@@ -499,7 +687,7 @@ void	ProcessData(void *pvData, int nDataLen)
 					break;
 
 				case PT_Shutdown:
-					Shutdown(0);
+					Shutdown();
 					break;
 				}
 			}
@@ -512,6 +700,7 @@ void	ProcessData(void *pvData, int nDataLen)
 				 * receive timeout because we have already
 				 * "flushed" any existing input.
 				 */
+				nCRCErrors++;
 				KillReceiveTimeout();
 				if (ppqList)
 					KillTransmitTimeout();
@@ -535,9 +724,12 @@ void	PacketReceiveData(void *pvData, int nDataLen)
 	char	cTmp;
 	int	nBitsLeft = 0;
 	int	iOut = 0;
+	int	i;
 	int	nBitsNow;
 	char	*pchDataOut;
 	char	*pchDataIn;
+	int	nBitsCode;
+	int	iHighSet;
 
 	if (!pvData)
 	{
@@ -550,29 +742,89 @@ void	PacketReceiveData(void *pvData, int nDataLen)
 
 	pchDataIn = (char *) pvData;
 	pchDataOut = (char *) malloc(nDataLen);
-	while (nDataLen || nBitsLeft)
+	switch(eLine)
 	{
-		if (nBitsLeft)
+	case E_6Bit:
+	case E_8NoHiCtrl:
+		if (eLine == E_6Bit)
+			nBitsCode = 6;
+		else
+			nBitsCode = 7;
+		while (nDataLen || nBitsLeft)
 		{
-			nBitsNow = 8 - nBits;
-			if (nBitsLeft < nBitsNow)
-				nBitsNow = nBitsLeft;
-			c <<= nBitsNow;
-			cTmp = cIn >> (nBitsLeft - nBitsNow);
-			cTmp &= ((1 << nBitsNow) - 1);
-			c |= cTmp;
-			nBits += nBitsNow;
-			nBitsLeft -= nBitsNow;
-			if (nBits == 8)
+			if (nBitsLeft)
 			{
-				pchDataOut[iOut++] = c;
-				nBits = 0;
+				nBitsNow = 8 - nBits;
+				if (nBitsLeft < nBitsNow)
+					nBitsNow = nBitsLeft;
+				c <<= nBitsNow;
+				cTmp = cIn >> (nBitsLeft - nBitsNow);
+				cTmp &= ((1 << nBitsNow) - 1);
+				c |= cTmp;
+				nBits += nBitsNow;
+				nBitsLeft -= nBitsNow;
+				if (nBits == 8)
+				{
+					pchDataOut[iOut++] = c;
+					nBits = 0;
+				}
+			}
+			else
+			{
+				cIn = *pchDataIn++;
+				nDataLen--;
+				if (cIn == '\030') /* ^X */
+				{
+					nCtlX++;
+					if (nCtlX >= 5)
+						Shutdown();
+					continue;
+				}
+				else
+				{
+					nCtlX = 0;
+				}
+				if (cIn == '@')
+				{
+					cIn = c = 0;
+					nBitsLeft = 0;
+					nBits = 0;
+				}
+				else
+				{
+					if (cIn & 0x80)
+					{
+						iHighSet = 1;
+						cIn &= 0x7f;
+					}
+					else
+					{
+						iHighSet = 0;
+					}
+					if (cIn >= 'A' && cIn <= 'Z')
+						cIn -= 'A';
+					else if (cIn >= 'a' && cIn <= 'z')
+						cIn = cIn - 'a' + 26;
+					else if (cIn >= '0' && cIn <= '9')
+						cIn = cIn - '0' + 52;
+					else if (cIn == '.')
+						cIn = 62;
+					else if (cIn == '/')
+						cIn = 63;
+					else
+						continue;
+					if (iHighSet)
+						cIn += 64;
+					nBitsLeft = nBitsCode;
+				}
 			}
 		}
-		else
+		break;
+
+	case E_Explicit:
+		while (nDataLen--)
 		{
 			cIn = *pchDataIn++;
-			nDataLen--;
 			if (cIn == '\030') /* ^X */
 			{
 				nCtlX++;
@@ -584,29 +836,74 @@ void	PacketReceiveData(void *pvData, int nDataLen)
 			{
 				nCtlX = 0;
 			}
-			if (cIn == '@')
+			for (i = 0; i < nIgnored; i++)
+				if (achIgnored[i] == cIn)
+					break;
+			if (i < nIgnored)
+				continue;
+			if (nBits == 1)
 			{
-				cIn = c = 0;
-				nBitsLeft = 0;
+				if (cIn == ' ')
+					pchDataOut[iOut++] = '@';
+				else
+					pchDataOut[iOut++] = cIn - nOffset;
 				nBits = 0;
+			}
+			else if (cIn == '@')
+			{
+				nBits = 1;
 			}
 			else
 			{
-				if (cIn >= 'A' && cIn <= 'Z')
-					cIn -= 'A';
-				else if (cIn >= 'a' && cIn <= 'z')
-					cIn = cIn - 'a' + 26;
-				else if (cIn >= '0' && cIn <= '9')
-					cIn = cIn - '0' + 52;
-				else if (cIn == '.')
-					cIn = 62;
-				else if (cIn == '/')
-					cIn = 63;
-				else
-					continue;
-				nBitsLeft = 6;
+				pchDataOut[iOut++] =cIn;
 			}
 		}
+		break;
+
+	case E_8Bit:
+	case E_8NoX:
+	case E_8NoCtrl:
+	case E_8NoHiX:
+		while (nDataLen--)
+		{
+			cIn = *pchDataIn++;
+			if (cIn == '\030') /* ^X */
+			{
+				nCtlX++;
+				if (nCtlX >= 5)
+					Shutdown();
+				continue;
+			}
+			else
+			{
+				nCtlX = 0;
+			}
+			if (nBits == 1)
+			{
+				if (cIn == ' ')
+					pchDataOut[iOut++] = '@';
+				else
+					pchDataOut[iOut++] = cIn - '@';
+				nBits = 0;
+			}
+			else if (nBits == 2)
+			{
+				pchDataOut[iOut++] = cIn | 0x80;
+			}
+			else if (nBits == 3)
+			{
+				pchDataOut[iOut++] = (cIn - '@') | 0x80;
+			}
+			else if (cIn == '@')
+			{
+				nBits = 1;
+			}
+			else
+			{
+				pchDataOut[iOut++] = cIn;
+			}
+		}
+		break;
 	}
 	ProcessData(pchDataOut, iOut);
 	free(pchDataOut);

@@ -4,19 +4,37 @@
  *  Copyright (C) 1994  Troy Rollo <troy@cbme.unsw.EDU.AU>
  *
  *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
+ *  it under the terms of the license in the file LICENSE.TXT included
+ *  with the TwinSock distribution.
  *
  *  This program is distributed in the hope that it will be useful,
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
  */
+
+#if defined(_Windows)
+#include <winsock.h>
+/*
+ * Global Function Prototypes
+ */
+int	SendData(void *pvData, int iDataLen);
+void	SetTransmitTimeout(void);
+void	KillTransmitTimeout(void);
+void	SetReceiveTimeout(void);
+void	KillReceiveTimeout(void);
+void	FlushInput(void);
+void	DataReceived(void *pvData, int iLen);
+void	Shutdown(void);
+BOOL	CommsEdit(HWND hwndParent);
+void	InitComm(int idComm);
+BOOL	DialNumber(HWND hwndParent);
+void	ShowProtoInfo(HWND hwndParent);
+void	About(HWND hwndParent);
+void	TimeoutReceived(void);
+void	PacketTransmitData(void *pvData, int iDataLen, int iStream);
+void	ReInitPackets(void);
+
+#endif
 
 enum	arg_type
 {
@@ -39,6 +57,17 @@ enum	arg_type
 	AT_IntPtr = AT_Int
 #endif
 #endif
+};
+
+enum Encoding
+{
+	E_6Bit = 0,
+	E_8Bit,
+	E_8NoCtrl,
+	E_8NoX,
+	E_8NoHiX,
+	E_8NoHiCtrl,
+	E_Explicit,
 };
 
 enum	Functions
@@ -66,7 +95,8 @@ enum	Functions
         FN_ServByPort,
         FN_ServByName,
         FN_ProtoByNumber,
-        FN_ProtoByName
+        FN_ProtoByName,
+	FN_Message
 };
 
 struct	func_arg
@@ -131,7 +161,8 @@ struct	per_socket
 	struct	per_socket	*ppsNext;
 	long			iEvents;
 	HWND			hWnd;
-	unsigned		wMsg;			
+	unsigned		wMsg;
+	long			nOutstanding;
 };
 
 #define	PSF_ACCEPT	0x0001
@@ -139,6 +170,10 @@ struct	per_socket
 #define	PSF_SHUTDOWN	0x0004
 #define	PSF_NONBLOCK	0x0008
 #define	PSF_CLOSED	0x0010
+#define	PSF_MUSTCONN	0x0020
+#define	PSF_CONNECTING	0x0040
+
+#define	MAX_OUTSTANDING	2048
 
 #define	INIT_ARGS(args, type, data, size) \
 		( args.at = type, \
@@ -159,3 +194,4 @@ struct	per_socket
 		  tf.pfaResult = &retval )
 
 #endif
+

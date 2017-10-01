@@ -16,6 +16,11 @@ if [ -f /usr/include/sys/select.h ]
 then
 	SELECT_H=-DNEED_SELECT_H
 	echo "You have sys/select.h"
+	if grep 'Santa Cruz Operation' /usr/include/sys/select.h >/dev/null
+	then
+		SELECT_H=
+		echo "but we won't use it since the SCO select.h is broken ..."
+	fi
 fi
 
 echo "Testing for sys/ttold.h"
@@ -128,9 +133,25 @@ else
 	fi
 fi
 
+if [ -f /usr/include/termios.h ]
+then
+	echo "Using POSIX terminals"
+	TERM_OBJECT=pterm.o
+else
+	echo "Using BSD terminals"
+	TERM_OBJECT=term.o
+fi
+
+case "`uname -s`" in
+OSF*)
+	echo "OSF doesn't like POSIX terminals, so we'd better use BSD ones."
+	TERM_OBJECT=term.o
+	;;
+esac
+
 rm -f a.out test.c
 
-OBJECTS="tshost.o packet.o commands.o term.o $NEED_MEM"
+OBJECTS="tshost.o packet.o getentry.o commands.o ${TERM_OBJECT} $NEED_MEM"
 
 echo "Building makefile"
 echo ".c.o:" > Makefile
@@ -140,7 +161,7 @@ echo "tshost: ${OBJECTS}" >> Makefile
 echo "	${CC} -o tshost ${OBJECTS} ${L_NSL} ${L_RESOLV} ${L_SOCKET}" >> Makefile
 
 echo
-echo 'Running "make"'
+echo 'Running "make -f Makefile"'
 echo
-exec make
+exec make -f Makefile
 
